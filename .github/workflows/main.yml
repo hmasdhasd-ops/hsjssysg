@@ -1,0 +1,71 @@
+name: VPS (Kali in container)
+on:
+  workflow_dispatch:
+jobs:
+  secure-vps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Install & Configure Docker
+        run: |
+          sudo apt update -y
+          sudo apt install -y docker.io
+          sudo systemctl enable --now docker
+          # allow runner to run docker (may require new session; commands use sudo docker anyway)
+          sudo usermod -aG docker $USER || true
+
+      - name: Pull Kali image
+        run: |
+          sudo docker pull kalilinux/kali-rolling
+          echo "✅ Pulled kalilinux/kali-rolling"
+
+      - name: Start Kali container
+        run: |
+          # Run container in privileged mode so it can run network tools and tailscale
+          sudo docker run -d --name kali-vps --privileged --hostname kali-vps kalilinux/kali-rolling sleep infinity
+          echo "✅ Kali container started (name: kali-vps)"
+
+      - name: Install & Configure SSH inside Kali container
+        run: |
+          # install openssh-server inside the container
+          sudo docker exec kali-vps bash -c "apt update -y && DEBIAN_FRONTEND=noninteractive apt install -y openssh-server"
+          # ensure ssh directories and start script
+          sudo docker exec kali-vps bash -c "mkdir -p /var/run/sshd"
+          # set root password
+          sudo docker exec kali-vps bash -c "echo 'root:admin@123' | chpasswd"
+          # allow root login
+          sudo docker exec kali-vps bash -c "grep -q '^PermitRootLogin' /etc/ssh/sshd_config && sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config || echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config"
+          # start sshd
+          sudo docker exec kali-vps bash -c "/usr/sbin/sshd"
+          echo "✅ SSH configured inside Kali container (user: root | pass: admin@123)"
+
+      - name: Install Tailscale inside Kali container
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          # install tailscale using official script inside container
+          sudo docker exec kali-vps bash -c "curl -fsSL https://tailscale.com/install.sh | sh"
+          # bring up tailscale inside the container (uses secret from runner env)
+          sudo docker exec kali-vps bash -c "tailscale up --authkey=${TAILSCALE_AUTH_KEY} --hostname=kali-vps-${{ github.run_id }} || tailscale up --authkey=${TAILSCALE_AUTH_KEY} --hostname=kali-vps-${{ github.run_id }} --accept-routes || true"
+          # give tailscale a moment then grab IPv4
+          sleep 3
+          TSIP=$(sudo docker exec kali-vps bash -lc "tailscale ip -4 | head -n1" || echo "")
+          echo "TAILSCALE_IP=$TSIP" >> $GITHUB_ENV
+          echo "✅ Tailscale IP inside container: $TSIP"
+
+      - name: Verify SSH Access
+        run: |
+          echo "Tailscale Kali container ready!"
+          echo "IP: ${{ env.TAILSCALE_IP }}"
+          echo "User: root"
+          echo "Pass: admin@123"
+          echo "To connect via tailnet: ssh root@${{ env.TAILSCALE_IP }} (use SSH key or the above password)"
+
+      - name: Keep VPS Alive
+        run: |
+          # keep the job alive and the container running for the duration of the workflow
+          while true; do
+            echo "[$(date)] Kali container still running..."
+            sudo docker exec kali-vps bash -c "ps aux | grep -E 'sshd|tailscaled' || true"
+            sleep 300
+          done
